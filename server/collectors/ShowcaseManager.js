@@ -17,6 +17,7 @@ import {
   pollServerGenerationRates,
   round2,
   runStreamingRequest,
+  streamTimeoutForTokens,
 } from "./LlmStreaming.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -27,10 +28,19 @@ const HISTORY_PATH =
   path.join(ROOT, "config", "showcase-history.json");
 /** Keep last N finished showcases per Spark (full stream text included). */
 const HISTORY_LIMIT = 20;
+/**
+ * Per-stream char cap for archived history text. Live buffers can hold a full
+ * 128k-token fill (~1 MB); history truncates so config/showcase-history.json
+ * stays manageable with 20 runs per Spark.
+ */
+const HISTORY_TEXT_CHAR_CAP = 250_000;
+/** Rough per-Spark byte budget for archived stream text (~8 MB JSON). */
+const HISTORY_BYTE_BUDGET = 8 * 1024 * 1024;
 
 const DEFAULT_MAX_TOKENS = 512;
 const MIN_MAX_TOKENS = 64;
-const MAX_MAX_TOKENS = 2048;
+/** 128k ceiling: long-context models (e.g. Llama 3.1 70B) accept max_tokens up to 131072. */
+const MAX_MAX_TOKENS = 131_072;
 const DEFAULT_TEMPERATURE = 0.7;
 const MIN_TEMPERATURE = 0;
 const MAX_TEMPERATURE = 2;
@@ -38,19 +48,58 @@ const MIN_PROMPTS = 1;
 const MAX_PROMPTS = 32;
 const MIN_PROMPT_LEN = 1;
 const MAX_PROMPT_LEN = 4000;
-const HEARTBEAT_TIMEOUT_MS = 5_000;
+const HEARTBEAT_TIMEOUT_MS = 30_000;
 const HEARTBEAT_CHECK_MS = 1_000;
-/** Full max_tokens fills at low tok/s need a longer per-stream budget than decode bench. */
-const PER_REQUEST_TIMEOUT_MS = 360_000;
 const LABEL_CHARS = 40;
 
 /**
- * Cap accumulated content per stream at min(maxTokens * 16, 200_000) chars.
- * Generous vs ~4 chars/token so full max_tokens fills aren't clipped in the UI.
+ * Cap accumulated content per stream at min(maxTokens * 8, 2_000_000) chars.
+ * ~4 chars/token with 2x headroom so a full 128k-token fill (~512k chars) is
+ * never clipped in the live buffers.
  * @param {number} maxTokens
  */
-function contentCap(maxTokens) {
-  return Math.min(Math.max(1, maxTokens) * 16, 200_000);
+export function contentCap(maxTokens) {
+  return Math.min(Math.max(1, maxTokens) * 8, 2_000_000);
+}
+
+/**
+ * Clamp requested max tokens to the model's known context window.
+ * `max_tokens` can never exceed the context length (the prompt also consumes
+ * context); requesting more than the model supports either 400s at the backend
+ * or silently truncates. Returns the requested value unchanged when the context
+ * is unknown.
+ * @param {number} requested
+ * @param {number | null | undefined} contextLength
+ */
+export function clampMaxTokensToContext(requested, contextLength) {
+  const n = Math.max(1, Math.round(Number(requested) || 0));
+  const ctx = Math.round(Number(contextLength) || 0);
+  if (!Number.isFinite(ctx) || ctx <= 0) return n;
+  return Math.min(n, ctx);
+}
+
+/** Rough JSON size (bytes) of one archived record (text × ~1.5 for escaping). */
+function historyRecordSizeBytes(record) {
+  let chars = 0;
+  for (const s of record?.streams || []) {
+    chars += (s.content?.length || 0) + (s.reasoning?.length || 0);
+  }
+  return Math.round(chars * 1.5) + 4096;
+}
+
+/** Keep newest records up to HISTORY_LIMIT and the per-Spark byte budget. */
+function trimHistoryList(list) {
+  const capped = list.slice(0, HISTORY_LIMIT);
+  const out = [];
+  let bytes = 0;
+  for (const r of capped) {
+    const size = historyRecordSizeBytes(r);
+    // Always keep the newest record even if it alone exceeds the budget.
+    if (out.length > 0 && bytes + size > HISTORY_BYTE_BUDGET) break;
+    out.push(r);
+    bytes += size;
+  }
+  return out;
 }
 
 const PROMPT_TYPES = new Set(["structural", "text", "mixed"]);
@@ -104,23 +153,37 @@ function isTerminalStreamStatus(status) {
  * @param {{ fromHistory?: boolean }} [opts]
  */
 function publicSessionRecord(session, opts = {}) {
-  const streams = (session.streams || []).map((s) => ({
-    streamId: s.streamId,
-    label: s.label,
-    prompt: s.prompt,
-    status: s.status,
-    content: s.content || "",
-    reasoning: s.reasoning || "",
-    contentLength: s.contentLength ?? (s.content || "").length,
-    reasoningLength: s.reasoningLength ?? (s.reasoning || "").length,
-    tokenCount: s.tokenCount || 0,
-    ttftMs: s.ttftMs ?? null,
-    decodeTps: s.decodeTps || 0,
-    liveTokPerSec: s.liveTokPerSec || s.decodeTps || 0,
-    peakTokPerSec: s.peakTokPerSec || 0,
-    model: s.model ?? null,
-    error: s.error ?? null,
-  }));
+  const fromHistory = Boolean(opts.fromHistory);
+  const streams = (session.streams || []).map((s) => {
+    let content = s.content || "";
+    let reasoning = s.reasoning || "";
+    // History keeps full-length runs readable but bounded on disk.
+    if (fromHistory) {
+      if (content.length > HISTORY_TEXT_CHAR_CAP) {
+        content = `${content.slice(0, HISTORY_TEXT_CHAR_CAP)}\n…[truncated for history]`;
+      }
+      if (reasoning.length > HISTORY_TEXT_CHAR_CAP) {
+        reasoning = `${reasoning.slice(0, HISTORY_TEXT_CHAR_CAP)}\n…[truncated for history]`;
+      }
+    }
+    return {
+      streamId: s.streamId,
+      label: s.label,
+      prompt: s.prompt,
+      status: s.status,
+      content,
+      reasoning,
+      contentLength: content.length,
+      reasoningLength: reasoning.length,
+      tokenCount: s.tokenCount || 0,
+      ttftMs: s.ttftMs ?? null,
+      decodeTps: s.decodeTps || 0,
+      liveTokPerSec: s.liveTokPerSec || s.decodeTps || 0,
+      peakTokPerSec: s.peakTokPerSec || 0,
+      model: s.model ?? null,
+      error: s.error ?? null,
+    };
+  });
 
   const totalTokens = streams.reduce((sum, s) => sum + (s.tokenCount || 0), 0);
   const decodeRates = streams.map((s) => s.decodeTps || 0).filter((r) => r > 0);
@@ -141,6 +204,7 @@ function publicSessionRecord(session, opts = {}) {
     port: session.port,
     modelId: session.modelId ?? null,
     maxTokens: session.maxTokens ?? null,
+    modelContextLength: session.modelContextLength ?? null,
     temperature: session.temperature ?? DEFAULT_TEMPERATURE,
     thinking: session.thinking !== false,
     promptType: session.promptType ?? null,
@@ -168,6 +232,7 @@ function historySummary(record) {
     port: record.port,
     modelId: record.modelId ?? null,
     maxTokens: record.maxTokens ?? null,
+    modelContextLength: record.modelContextLength ?? null,
     temperature: record.temperature ?? DEFAULT_TEMPERATURE,
     thinking: record.thinking !== false,
     promptType: record.promptType ?? null,
@@ -206,14 +271,34 @@ export class ShowcaseManager {
       if (!data || typeof data !== "object") return;
       for (const [sparkId, list] of Object.entries(data)) {
         if (!Array.isArray(list)) continue;
-        const cleaned = list
-          .filter((r) => r && typeof r === "object" && r.sessionId && r.sparkId)
-          .slice(0, HISTORY_LIMIT)
-          .map((r) => ({
-            ...r,
-            status: r.status === "running" ? "cancelled" : r.status || "completed",
-            fromHistory: true,
-          }));
+        const cleaned = trimHistoryList(
+          list
+            .filter((r) => r && typeof r === "object" && r.sessionId && r.sparkId)
+            .slice(0, HISTORY_LIMIT)
+            .map((r) => ({
+              ...r,
+              status: r.status === "running" ? "cancelled" : r.status || "completed",
+              fromHistory: true,
+              // Re-apply caps to records written before this limit existed.
+              streams: (r.streams || []).map((s) => {
+                const content =
+                  (s?.content || "").length > HISTORY_TEXT_CHAR_CAP
+                    ? `${String(s.content).slice(0, HISTORY_TEXT_CHAR_CAP)}\n…[truncated for history]`
+                    : s?.content || "";
+                const reasoning =
+                  (s?.reasoning || "").length > HISTORY_TEXT_CHAR_CAP
+                    ? `${String(s.reasoning).slice(0, HISTORY_TEXT_CHAR_CAP)}\n…[truncated for history]`
+                    : s?.reasoning || "";
+                return {
+                  ...(s || {}),
+                  content,
+                  reasoning,
+                  contentLength: content.length,
+                  reasoningLength: reasoning.length,
+                };
+              }),
+            }))
+        );
         if (cleaned.length) this.historyBySpark.set(sparkId, cleaned);
       }
     } catch (err) {
@@ -242,10 +327,10 @@ export class ShowcaseManager {
     if (!session || session.status === "running") return;
     const record = publicSessionRecord(session, { fromHistory: true });
     const list = this.historyBySpark.get(session.sparkId) || [];
-    const next = [
+    const next = trimHistoryList([
       record,
       ...list.filter((r) => r.sessionId !== record.sessionId),
-    ].slice(0, HISTORY_LIMIT);
+    ]);
     this.historyBySpark.set(session.sparkId, next);
     this._saveHistory();
   }
@@ -320,6 +405,7 @@ export class ShowcaseManager {
    *   port: number,
    *   modelId?: string | null,
    *   maxTokens?: number,
+   *   contextLength?: number | null,
    *   temperature?: number,
    *   thinking?: boolean,
    *   promptType?: string | null,
@@ -334,6 +420,7 @@ export class ShowcaseManager {
       port,
       modelId = null,
       maxTokens: rawMax,
+      contextLength: rawContextLength,
       temperature: rawTemp,
       thinking: rawThinking,
       promptType: rawPromptType,
@@ -370,6 +457,28 @@ export class ShowcaseManager {
       );
       err.status = 400;
       throw err;
+    }
+
+    // Clamp to the probed model context window when known (from /v1/models
+    // max_model_len etc.). max_tokens beyond the context would 400 at the
+    // backend; a tiny context below the floor makes a full-length demo pointless.
+    const modelContextLength = Number(rawContextLength);
+    if (
+      rawContextLength != null &&
+      Number.isFinite(modelContextLength) &&
+      modelContextLength >= 1
+    ) {
+      maxTokens = clampMaxTokensToContext(maxTokens, modelContextLength);
+      if (maxTokens < MIN_MAX_TOKENS) {
+        const err = new Error(
+          `Model context (${Math.round(modelContextLength)} tokens) is too small for a showcase run (min ${MIN_MAX_TOKENS})`
+        );
+        err.status = 400;
+        throw err;
+      }
+    } else if (rawContextLength != null) {
+      // Bogus context signal (e.g. "NaN") — ignore rather than trust it.
+      console.warn("[Showcase] ignoring invalid contextLength:", rawContextLength);
     }
 
     let temperature = Number(rawTemp);
@@ -436,6 +545,10 @@ export class ShowcaseManager {
       port: p,
       modelId: modelId || null,
       maxTokens,
+      modelContextLength:
+        Number.isFinite(modelContextLength) && modelContextLength >= 1
+          ? Math.round(modelContextLength)
+          : null,
       temperature,
       thinking,
       promptType,
@@ -726,7 +839,10 @@ export class ShowcaseManager {
       stream._t0 = performance.now();
       this._bumpRev(session);
 
-      const timeout = setTimeout(() => ctrl.abort(), PER_REQUEST_TIMEOUT_MS);
+      const timeout = setTimeout(
+        () => ctrl.abort(),
+        streamTimeoutForTokens(session.maxTokens)
+      );
 
       return runStreamingRequest(url, body, ctrl.signal, {
         collectContent: true,

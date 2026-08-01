@@ -7,6 +7,22 @@ Format: version sections are listed newest first.
 
 ---
 
+## [Unreleased]
+
+### Added
+- **Showcase max tokens up to 128k** — the prompt showcase (and decode bench) ceiling rises from 2048 to 131072 tokens for long-context models; defaults are now served from `SHOWCASE_DEFAULTS` instead of hardcoded in the UI
+- **Model context-aware clamping** — `max_tokens` is clamped to the probed model context window (`/v1/models` `max_model_len`, SGLang `max_total_tokens`, llama.cpp `total_context_length`); the effective context is stored on runs and shown in the UI, and out-of-range presets are disabled
+- **Token presets** — quick-select chips (512 / 2k / 8k / 32k / 64k / 128k) under the Max tokens field
+
+### Changed
+- **Per-stream timeouts scale with tokens** — 128k fills get a ~110 min budget (20 tok/s floor + base), capped at 4 h, instead of the flat 360 s that killed long runs mid-generation; decode bench waves scale the same way
+- **Content cap scales with tokens** — live buffers hold up to `min(maxTokens × 8, 2 MB)` chars so full 128k outputs are never silently clipped (previously capped at 200k chars ≈ 50k tokens)
+- **Live terminal rendering windows** — while streaming, each terminal renders only the latest 60k chars; the full text stays buffered and is used by Copy, with a “live view truncated” note; finished/history views show everything
+- **History bounded for long runs** — archived stream text is truncated to 250k chars per stream and per-Spark history is capped at an ~8 MB byte budget so 128k runs don’t balloon `config/showcase-history.json`
+- **Heartbeat timeout raised to 30 s** — long fills survive backgrounded browser tabs (was 5 s)
+
+---
+
 ## [1.4.5] — 2026-07-31
 
 ### Fixed

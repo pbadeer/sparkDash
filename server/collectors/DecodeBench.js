@@ -17,6 +17,7 @@ import {
   round2,
   runStreamingRequest,
   sleep,
+  streamTimeoutForTokens,
 } from "./LlmStreaming.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -68,9 +69,8 @@ const BENCH_PROMPTS = [
 const ALLOWED_CONCURRENCIES = new Set([1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32]);
 const DEFAULT_MAX_TOKENS = 500;
 const MIN_MAX_TOKENS = 64;
-const MAX_MAX_TOKENS = 2048;
-const PER_REQUEST_TIMEOUT_MS = 180_000;
-const WAVE_TIMEOUT_MS = 300_000;
+/** Matches the showcase ceiling: 128k for long-context models. */
+const MAX_MAX_TOKENS = 131_072;
 const HISTORY_LIMIT = 10;
 /** Hardware sample cadence while a concurrency wave runs (debug timeline). */
 const HARDWARE_SAMPLE_MS = 1_000;
@@ -227,6 +227,10 @@ async function runConcurrencyWave({
   const url = `${baseUrl}/v1/chat/completions`;
   const prompts = pickDistinctPrompts(concurrency);
   const reqMeta = { url, modelId, maxTokens };
+  // Timeouts scale with the requested token budget: 128k fills can take ~1.5 h
+  // on slow backends; the wave gets a little extra over the longest stream.
+  const streamTimeoutMs = streamTimeoutForTokens(maxTokens);
+  const waveTimeoutMs = streamTimeoutMs + 60_000;
 
   const wallStart = performance.now();
 
@@ -268,7 +272,7 @@ async function runConcurrencyWave({
     };
     applyThinkingFlags(body, modelId, true);
 
-    const timeout = setTimeout(() => ctrl.abort(), PER_REQUEST_TIMEOUT_MS);
+    const timeout = setTimeout(() => ctrl.abort(), streamTimeoutMs);
     return runStreamingRequest(url, body, ctrl.signal, {
       debug,
       retryOnThinking400: true,
@@ -284,7 +288,7 @@ async function runConcurrencyWave({
   const waveTimer = setTimeout(() => {
     waveTimedOut = true;
     for (const c of controllers) c.abort();
-  }, WAVE_TIMEOUT_MS);
+  }, waveTimeoutMs);
 
   let results;
   try {
@@ -306,7 +310,7 @@ async function runConcurrencyWave({
       waveMs,
       results,
       modelId,
-      `Wave timed out after ${WAVE_TIMEOUT_MS}ms`,
+      `Wave timed out after ${waveTimeoutMs}ms`,
       prompts,
       debug
     );

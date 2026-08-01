@@ -66,8 +66,19 @@ test("ShowcaseManager request body forces full-length generation", () => {
   assert.match(managerSrc, /stop:\s*\[\s*\]/);
   assert.match(managerSrc, /withFillToMaxInstruction/);
   assert.match(managerSrc, /stripFillForceFields/);
-  assert.match(managerSrc, /PER_REQUEST_TIMEOUT_MS = 360_000/);
+  // Per-stream timeout scales with the requested token budget (up to 128k).
+  assert.match(managerSrc, /streamTimeoutForTokens\(session\.maxTokens\)/);
 });
+
+test("ShowcaseManager ceiling is 128k and min stays 64", () => {
+  assert.match(managerSrc, /MAX_MAX_TOKENS = 131_072/);
+  assert.match(managerSrc, /MIN_MAX_TOKENS = 64/);
+  // UI must not hardcode the old 2048 cap anymore.
+  assert.doesNotMatch(managerSrc, /MAX_MAX_TOKENS = 2048/);
+});
+
+// "ShowcaseManager clamps max_tokens to the probed model context window" —
+// covered in showcaseTokens.test.js via clampMaxTokensToContext.
 
 test("ShowcaseManager persists promptType on sessions", () => {
   assert.match(managerSrc, /promptType:\s*session\.promptType/);

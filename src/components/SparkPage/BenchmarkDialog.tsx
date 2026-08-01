@@ -7,7 +7,7 @@ import {
   listDecodeBench,
   startDecodeBench,
 } from "../../api/client";
-import type { DecodeBenchJob } from "../../api/types";
+import type { DecodeBenchDefaults, DecodeBenchJob } from "../../api/types";
 import { useModalPresence } from "../../hooks/useModalPresence";
 
 const CONCURRENCY_OPTIONS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 24, 32] as const;
@@ -152,6 +152,7 @@ export function BenchmarkDialog({
   const [starting, setStarting] = useState(false);
   const [loadingLast, setLoadingLast] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [defaults, setDefaults] = useState<DecodeBenchDefaults | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const copyResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -207,6 +208,7 @@ export function BenchmarkDialog({
     listDecodeBench(sparkId, llmPort)
       .then((data) => {
         if (cancelled) return;
+        if (data.defaults) setDefaults(data.defaults);
         if (data.active) {
           setJob(data.active);
           applyJobConfig(data.active);
@@ -258,9 +260,11 @@ export function BenchmarkDialog({
       setError("Select at least one concurrency level");
       return;
     }
+    const minTok = defaults?.minMaxTokens ?? 64;
+    const maxTok = defaults?.maxMaxTokens ?? 131_072;
     const maxTokens = parseInt(maxTokensDraft.trim(), 10);
-    if (!Number.isInteger(maxTokens) || maxTokens < 64 || maxTokens > 2048) {
-      setError("Max tokens must be an integer between 64 and 2048");
+    if (!Number.isInteger(maxTokens) || maxTokens < minTok || maxTokens > maxTok) {
+      setError(`Max tokens must be an integer between ${minTok} and ${maxTok}`);
       return;
     }
     setStarting(true);
@@ -424,7 +428,10 @@ export function BenchmarkDialog({
                   <label htmlFor="bench-max-tokens" className="bench-sheet__section-title">
                     Max tokens / stream
                   </label>
-                  <p className="bench-sheet__hint">Default 500 · range 64–2048</p>
+                  <p className="bench-sheet__hint">
+                    Default {defaults?.defaultMaxTokens ?? 500} · range{" "}
+                    {defaults?.minMaxTokens ?? 64}–{defaults?.maxMaxTokens ?? 131_072}
+                  </p>
                 </div>
                 <input
                   id="bench-max-tokens"

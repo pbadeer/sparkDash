@@ -16,7 +16,7 @@ import {
   decodeBenchManager,
   DECODE_BENCH_DEFAULTS,
 } from "./collectors/DecodeBench.js";
-import { showcaseManager } from "./collectors/ShowcaseManager.js";
+import { showcaseManager, SHOWCASE_DEFAULTS } from "./collectors/ShowcaseManager.js";
 
 dotenv.config();
 
@@ -763,17 +763,21 @@ app.post("/api/sparks/:id/llm/showcase", (req, res) => {
     return res.status(400).json({ error: "port is not configured for this Spark" });
   }
 
-  let modelId = req.body?.modelId || null;
-  if (!modelId && monitor) {
-    const snap = monitor.snapshot();
-    const llmList = Array.isArray(snap?.metrics?.llm) ? snap.metrics.llm : [];
-    const portIndex = ports.indexOf(port);
-    const llm =
-      (portIndex >= 0 ? llmList[portIndex] : null) ||
-      llmList.find((m) => m?.available) ||
-      llmList[0];
-    modelId = llm?.modelId || null;
-  }
+  // Probed model info for this port (id + context window) — used as the
+  // fallback modelId and to clamp max_tokens to what the model actually allows.
+  const snap = monitor?.snapshot ? monitor.snapshot() : null;
+  const llmList = Array.isArray(snap?.metrics?.llm) ? snap.metrics.llm : [];
+  const portIndex = ports.indexOf(port);
+  const llm =
+    (portIndex >= 0 ? llmList[portIndex] : null) ||
+    llmList.find((m) => m?.available) ||
+    llmList[0];
+
+  let modelId = req.body?.modelId || llm?.modelId || null;
+  const contextLength =
+    Number.isFinite(Number(llm?.contextLength)) && Number(llm?.contextLength) >= 1
+      ? Number(llm?.contextLength)
+      : null;
 
   try {
     const result = showcaseManager.start({
@@ -781,6 +785,7 @@ app.post("/api/sparks/:id/llm/showcase", (req, res) => {
       lanIp: spark.lanIp,
       port,
       modelId,
+      contextLength,
       maxTokens: req.body?.maxTokens,
       temperature: req.body?.temperature,
       thinking: req.body?.thinking,
@@ -809,6 +814,7 @@ app.get("/api/sparks/:id/llm/showcase", (req, res) => {
   res.json({
     active: showcaseManager.getActive(spark.id),
     history: showcaseManager.getHistory(spark.id),
+    defaults: SHOWCASE_DEFAULTS,
   });
 });
 

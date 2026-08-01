@@ -9,6 +9,7 @@ import {
   startShowcase,
 } from "../../api/client";
 import type {
+  ShowcaseDefaults,
   ShowcaseHistorySummary,
   ShowcaseSessionState,
   SparkConfig,
@@ -24,6 +25,15 @@ import {
 
 const POLL_MS = 300;
 const DEFAULT_MAX_TOKENS = 512;
+const MIN_MAX_TOKENS_FALLBACK = 64;
+const MAX_MAX_TOKENS_FALLBACK = 131_072;
+/** Quick-select token presets shown under the Max tokens field. */
+const TOKEN_PRESETS = [512, 2_048, 8_192, 32_768, 65_536, 131_072] as const;
+/**
+ * While streaming, keep the DOM cheap on 128k runs by rendering only the tail
+ * of each terminal. Full text always lives in state and is used for copy.
+ */
+const LIVE_RENDER_CHARS = 60_000;
 const DEFAULT_PROMPT_TYPE: ShowcasePromptType = "mixed";
 const DEFAULT_TEMPERATURE = 0.7;
 const MIN_TEMPERATURE = 0;
@@ -210,6 +220,8 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
   const [history, setHistory] = useState<ShowcaseHistorySummary[]>([]);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [viewingHistory, setViewingHistory] = useState(false);
+  const [showcaseDefaults, setShowcaseDefaults] = useState<ShowcaseDefaults | null>(null);
+  const [modelContextLength, setModelContextLength] = useState<number | null>(null);
 
   const revRef = useRef<number | null>(null);
   const sessionIdRef = useRef<string | null>(null);
@@ -224,6 +236,15 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
     if (spark.llmPort) return [spark.llmPort];
     return [8888];
   }, [spark]);
+
+  const maxTokensMin = showcaseDefaults?.minMaxTokens ?? MIN_MAX_TOKENS_FALLBACK;
+  const maxTokensMax =
+    modelContextLength != null && modelContextLength > 0
+      ? Math.min(
+          showcaseDefaults?.maxMaxTokens ?? MAX_MAX_TOKENS_FALLBACK,
+          modelContextLength
+        )
+      : showcaseDefaults?.maxMaxTokens ?? MAX_MAX_TOKENS_FALLBACK;
 
   const canRun =
     Boolean(spark) &&
@@ -344,6 +365,9 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
           llmList[0];
         const id = llm?.modelId?.trim() || null;
         if (id) setModelId(id);
+        const ctx = Number(llm?.contextLength);
+        if (Number.isFinite(ctx) && ctx >= 1) setModelContextLength(ctx);
+        else setModelContextLength(null);
       })
       .catch(() => {
         /* keep query / prior modelId */
@@ -479,6 +503,7 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
     try {
       const data = await listShowcase(sparkId);
       setHistory(data.history || []);
+      if (data.defaults) setShowcaseDefaults(data.defaults);
     } catch {
       /* ignore list failures in UI */
     } finally {
@@ -563,9 +588,12 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
       if (trimmed.length < MIN_TERMINALS || trimmed.length > MAX_TERMINALS) {
         throw new Error(`Use between ${MIN_TERMINALS} and ${MAX_TERMINALS} non-empty prompts`);
       }
+      // Reflect the same clamp the server applies (context window / hard ceiling).
+      const sendMaxTokens = Math.min(maxTokens, maxTokensMax);
+      setMaxTokens(sendMaxTokens);
       const started = await startShowcase(sparkId, {
         port,
-        maxTokens,
+        maxTokens: sendMaxTokens,
         temperature,
         thinking,
         modelId: modelId || undefined,
@@ -599,6 +627,7 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
     promptType,
     pollOnce,
     schedulePoll,
+    maxTokensMax,
   ]);
 
   const handleOpenHistoryRun = useCallback(
@@ -888,13 +917,54 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
                 <span className="showcase-field__label">Max tokens</span>
                 <input
                   type="number"
-                  min={64}
-                  max={2048}
+                  min={maxTokensMin}
+                  max={maxTokensMax}
                   step={64}
                   value={maxTokens}
                   disabled={controlsLocked}
+                  title={
+                    modelContextLength != null
+                      ? `Model context is ${modelContextLength.toLocaleString()} tokens — max_tokens is clamped to it`
+                      : undefined
+                  }
                   onChange={(e) => setMaxTokens(Number(e.target.value) || DEFAULT_MAX_TOKENS)}
                 />
+                <div className="showcase-token-presets" aria-label="Max token presets">
+                  {TOKEN_PRESETS.map((n) => {
+                    const overModel =
+                      modelContextLength != null && n > modelContextLength;
+                    return (
+                      <button
+                        key={n}
+                        type="button"
+                        className={`showcase-token-preset${maxTokens === n ? " is-active" : ""}`}
+                        disabled={controlsLocked || overModel}
+                        title={
+                          overModel
+                            ? `Exceeds model context (${modelContextLength.toLocaleString()} tokens)`
+                            : n >= 1024
+                              ? `${n.toLocaleString()} tokens`
+                              : `${n} tokens`
+                        }
+                        onClick={() => setMaxTokens(n)}
+                      >
+                        {n >= 1_048_576
+                          ? `${(n / 1_048_576).toFixed(1)}M`
+                          : n >= 1024
+                            ? `${Math.round(n / 1024)}k`
+                            : n}
+                      </button>
+                    );
+                  })}
+                </div>
+                {modelContextLength != null && (
+                  <span className="showcase-field__hint">
+                    context {modelContextLength >= 1000
+                      ? `${(modelContextLength / 1000).toFixed(1)}k`
+                      : modelContextLength.toLocaleString()}{" "}
+                    tok
+                  </span>
+                )}
               </label>
               <label className="showcase-field">
                 <span className="showcase-field__label">Temp</span>
@@ -1209,24 +1279,42 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
           ["--showcase-rows" as string]: String(gridRows),
         }}
       >
-        {displayStreams.map((s) => (
-          <TerminalCard
-            key={s.streamId}
-            label={s.label}
-            status={s.status}
-            liveTokPerSec={s.liveTokPerSec}
-            peakTokPerSec={s.peakTokPerSec}
-            content={s.content}
-            reasoning={s.reasoning}
-            error={s.error}
-            onCopy={
-              s.content || s.reasoning || s.error
-                ? () => void handleCopyOne(s)
-                : undefined
-            }
-            copied={copiedId === s.streamId}
-          />
-        ))}
+        {displayStreams.map((s) => {
+          const streaming = s.status === "streaming";
+          // Render only the tail during live streaming so 128k runs keep the
+          // DOM light; full text stays in state for copy / completion.
+          const renderContent =
+            streaming && s.content.length > LIVE_RENDER_CHARS
+              ? `…\n${s.content.slice(-LIVE_RENDER_CHARS)}`
+              : s.content;
+          const renderReasoning =
+            streaming && s.reasoning.length > LIVE_RENDER_CHARS
+              ? `…\n${s.reasoning.slice(-LIVE_RENDER_CHARS)}`
+              : s.reasoning;
+          const liveTruncated =
+            streaming &&
+            s.content.length + s.reasoning.length > LIVE_RENDER_CHARS;
+          return (
+            <TerminalCard
+              key={s.streamId}
+              label={s.label}
+              status={s.status}
+              liveTokPerSec={s.liveTokPerSec}
+              peakTokPerSec={s.peakTokPerSec}
+              content={renderContent}
+              reasoning={renderReasoning}
+              error={s.error}
+              fullContentLength={s.content.length + s.reasoning.length}
+              truncated={liveTruncated}
+              onCopy={
+                s.content || s.reasoning || s.error
+                  ? () => void handleCopyOne(s)
+                  : undefined
+              }
+              copied={copiedId === s.streamId}
+            />
+          );
+        })}
       </div>
 
       {sessionId && sessionStatus && sessionStatus !== "running" && (

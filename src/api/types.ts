@@ -461,6 +461,8 @@ export interface ShowcaseSessionState {
   port: number;
   modelId?: string | null;
   maxTokens?: number | null;
+  /** Probed model context window (tokens) that maxTokens was clamped to. */
+  modelContextLength?: number | null;
   temperature?: number;
   thinking?: boolean;
   promptType?: ShowcasePromptType | null;
@@ -488,6 +490,7 @@ export interface ShowcaseHistorySummary {
   port: number;
   modelId?: string | null;
   maxTokens?: number | null;
+  modelContextLength?: number | null;
   temperature?: number;
   thinking?: boolean;
   promptType?: ShowcasePromptType | null;
@@ -502,9 +505,24 @@ export interface ShowcaseHistorySummary {
   error?: string | null;
 }
 
+/** Server-side showcase defaults, mirrored from SHOWCASE_DEFAULTS. */
+export interface ShowcaseDefaults {
+  defaultMaxTokens: number;
+  minMaxTokens: number;
+  maxMaxTokens: number;
+  defaultTemperature: number;
+  minTemperature: number;
+  maxTemperature: number;
+  minPrompts: number;
+  maxPrompts: number;
+  heartbeatTimeoutMs: number;
+  historyLimit: number;
+}
+
 export interface ShowcaseListResponse {
   active: { sessionId: string; status: string } | null;
   history: ShowcaseHistorySummary[];
+  defaults: ShowcaseDefaults;
 }
 
 export interface ShowcaseStartResponse {

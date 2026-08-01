@@ -10,6 +10,10 @@ export interface TerminalCardProps {
   error: string | null;
   onCopy?: () => void;
   copied?: boolean;
+  /** Full answer+reasoning chars across this terminal (even while tail-rendered). */
+  fullContentLength?: number;
+  /** True when the live render window is smaller than the buffered content. */
+  truncated?: boolean;
 }
 
 function statusClass(status: string): string {
@@ -37,6 +41,8 @@ export function TerminalCard({
   error,
   onCopy,
   copied,
+  fullContentLength,
+  truncated,
 }: TerminalCardProps) {
   const bodyRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -135,6 +141,21 @@ export function TerminalCard({
         {error ? <pre className="showcase-term__error">{`[error] ${error}`}</pre> : null}
       </div>
       <footer className="showcase-term__footer">
+        {fullContentLength != null && fullContentLength > 0 && (
+          <div className="showcase-term__meta">
+            <span className="showcase-term__chars" title="Buffered characters (answer + thinking)">
+              {fullContentLength.toLocaleString()} chars
+            </span>
+            {truncated && fullContentLength > 0 && (
+              <span
+                className="showcase-term__truncated"
+                title="Live view shows the latest segment. Copy the terminal to get everything."
+              >
+                live view truncated · copy for full text
+              </span>
+            )}
+          </div>
+        )}
         <div className="showcase-gauge" aria-hidden="true">
           <div
             className="showcase-gauge__fill"

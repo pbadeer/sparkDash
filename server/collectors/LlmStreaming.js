@@ -28,6 +28,29 @@ export function median(nums) {
   return s.length % 2 === 0 ? (s[mid - 1] + s[mid]) / 2 : s[mid];
 }
 
+/**
+ * Conservative decode speed floor used to size per-stream timeouts so full
+ * max_tokens fills (up to 128k) are not killed mid-generation on slow backends.
+ * 128k tokens at 20 tok/s would take ~106 min of decode alone.
+ */
+export const TIMEOUT_DECODE_TPS_FLOOR = 20;
+/** Connect + prefill + first-token buffer. */
+export const STREAM_TIMEOUT_BASE_MS = 360_000;
+/** Hard ceiling so a hung stream still fails within a sane window. */
+export const STREAM_TIMEOUT_MAX_MS = 4 * 3_600_000;
+
+/**
+ * Wall-clock budget (ms) for one streaming request producing up to `maxTokens`
+ * output tokens. Linear in token count with a fixed base, capped at 4 h.
+ * @param {number} maxTokens
+ * @returns {number}
+ */
+export function streamTimeoutForTokens(maxTokens) {
+  const n = Math.max(1, Math.round(Number(maxTokens) || 0));
+  const decodeMs = (n / TIMEOUT_DECODE_TPS_FLOOR) * 1000;
+  return Math.min(STREAM_TIMEOUT_MAX_MS, STREAM_TIMEOUT_BASE_MS + Math.round(decodeMs));
+}
+
 export function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
