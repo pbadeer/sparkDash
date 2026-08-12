@@ -2363,6 +2363,10 @@ input[type="checkbox"] {
   color: #7a9e8c;
   font-size: 0.9em;
 }
+.showcase-term__tps-prompt {
+  color: #c4b07a;
+  font-size: 0.9em;
+}
 .showcase-term__copy {
   flex-shrink: 0;
   border: 1px solid rgba(255, 255, 255, 0.14);

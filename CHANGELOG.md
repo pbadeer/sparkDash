@@ -10,6 +10,7 @@ Format: version sections are listed newest first.
 ## [Unreleased]
 
 ### Added
+- **Prompt processing tok/s** — the LLM card shows engine prefill speed next to generation tok/s (same `/metrics` / slots sources); showcase reports server prompt tok/s in the metrics strip and per-terminal prompt tok/s from `usage.prompt_tokens / TTFT`
 - **Showcase max tokens up to 128k** — the prompt showcase (and decode bench) ceiling rises from 2048 to 131072 tokens for long-context models; defaults are now served from `SHOWCASE_DEFAULTS` instead of hardcoded in the UI
 - **Model context-aware clamping** — `max_tokens` is clamped to the probed model context window (`/v1/models` `max_model_len`, SGLang `max_total_tokens`, llama.cpp `total_context_length`); the effective context is stored on runs and shown in the UI, and out-of-range presets are disabled
 - **Token presets** — quick-select chips (512 / 2k / 8k / 32k / 64k / 128k) under the Max tokens field

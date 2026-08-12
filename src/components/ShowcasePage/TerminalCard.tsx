@@ -5,6 +5,7 @@ export interface TerminalCardProps {
   status: string;
   liveTokPerSec: number;
   peakTokPerSec: number;
+  promptTokPerSec?: number;
   content: string;
   reasoning: string;
   error: string | null;
@@ -36,6 +37,7 @@ export function TerminalCard({
   status,
   liveTokPerSec,
   peakTokPerSec,
+  promptTokPerSec = 0,
   content,
   reasoning,
   error,
@@ -70,18 +72,41 @@ export function TerminalCard({
         <span
           className="showcase-term__tps font-tabular"
           title={
-            peakTokPerSec > 0 || liveTokPerSec > 0
-              ? `Live ${liveTokPerSec.toFixed(1)} tok/s · peak ${Math.max(peakTokPerSec, liveTokPerSec).toFixed(1)} tok/s`
+            peakTokPerSec > 0 || liveTokPerSec > 0 || promptTokPerSec > 0
+              ? [
+                  liveTokPerSec > 0 || peakTokPerSec > 0
+                    ? `Live gen ${liveTokPerSec.toFixed(1)} tok/s · peak ${Math.max(peakTokPerSec, liveTokPerSec).toFixed(1)} tok/s`
+                    : null,
+                  promptTokPerSec > 0
+                    ? `Prompt ${promptTokPerSec.toFixed(1)} tok/s (prompt tokens / TTFT)`
+                    : null,
+                ]
+                  .filter(Boolean)
+                  .join(" · ")
               : undefined
           }
         >
-          {liveTokPerSec > 0 || peakTokPerSec > 0 ? (
+          {liveTokPerSec > 0 || peakTokPerSec > 0 || promptTokPerSec > 0 ? (
             <>
-              {(liveTokPerSec > 0 ? liveTokPerSec : peakTokPerSec).toFixed(0)} tok/s
-              {peakTokPerSec > 0 && (
-                <span className="showcase-term__tps-peak">
-                  {" "}
-                  peak {Math.max(peakTokPerSec, liveTokPerSec).toFixed(0)}
+              {(liveTokPerSec > 0 || peakTokPerSec > 0) && (
+                <>
+                  {(liveTokPerSec > 0 ? liveTokPerSec : peakTokPerSec).toFixed(0)}
+                  {promptTokPerSec > 0 ? " gen" : " tok/s"}
+                  {peakTokPerSec > 0 && (
+                    <span className="showcase-term__tps-peak">
+                      {" "}
+                      peak {Math.max(peakTokPerSec, liveTokPerSec).toFixed(0)}
+                    </span>
+                  )}
+                </>
+              )}
+              {promptTokPerSec > 0 && (
+                <span className="showcase-term__tps-prompt">
+                  {(liveTokPerSec > 0 || peakTokPerSec > 0) ? " · " : ""}
+                  {promptTokPerSec >= 1000
+                    ? `${(promptTokPerSec / 1000).toFixed(1)}k`
+                    : promptTokPerSec.toFixed(0)}{" "}
+                  prompt
                 </span>
               )}
             </>

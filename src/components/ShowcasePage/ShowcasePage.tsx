@@ -91,6 +91,7 @@ interface LocalStream {
   tokenCount: number;
   ttftMs: number | null;
   decodeTps: number;
+  promptTps: number;
   liveTokPerSec: number;
   peakTokPerSec: number;
   error: string | null;
@@ -121,11 +122,12 @@ function readModelQuery(): string | null {
 
 function buildTerminalPlainText(s: LocalStream): string {
   const parts: string[] = [`## ${s.label || s.streamId}`, `status: ${s.status}`];
-  if (s.liveTokPerSec > 0 || s.decodeTps > 0 || s.peakTokPerSec > 0) {
+  if (s.liveTokPerSec > 0 || s.decodeTps > 0 || s.peakTokPerSec > 0 || s.promptTps > 0) {
     const live = s.liveTokPerSec || s.decodeTps;
     parts.push(
-      `tok/s: ${live > 0 ? live.toFixed(1) : "—"}` +
+      `gen tok/s: ${live > 0 ? live.toFixed(1) : "—"}` +
         (s.peakTokPerSec > 0 ? `  peak ${s.peakTokPerSec.toFixed(1)}` : "") +
+        (s.promptTps > 0 ? `  prompt ${s.promptTps.toFixed(1)}` : "") +
         (s.ttftMs != null ? `  TTFT ${s.ttftMs.toFixed(0)}ms` : "")
     );
   }
@@ -149,6 +151,7 @@ function buildAllPlainText(
     port: number;
     modelId: string | null;
     serverTps: number | null;
+    serverPrefillTps?: number | null;
     sessionAvgTps?: number | null;
   }
 ): string {
@@ -159,7 +162,10 @@ function buildAllPlainText(
       (meta.sessionAvgTps != null && meta.sessionAvgTps > 0
         ? `  · avg ${meta.sessionAvgTps.toFixed(0)} tok/s/stream`
         : "") +
-      (meta.serverTps != null ? `  · server ${meta.serverTps.toFixed(0)} tok/s` : ""),
+      (meta.serverTps != null ? `  · server gen ${meta.serverTps.toFixed(0)} tok/s` : "") +
+      (meta.serverPrefillTps != null
+        ? `  · server prompt ${meta.serverPrefillTps.toFixed(0)} tok/s`
+        : ""),
     "",
   ];
   return [...head, ...streams.map((s) => buildTerminalPlainText(s)), ""]
@@ -214,6 +220,8 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
   const [starting, setStarting] = useState(false);
   const [serverTps, setServerTps] = useState<number | null>(null);
   const [serverTpsMax, setServerTpsMax] = useState<number | null>(null);
+  const [serverPrefillTps, setServerPrefillTps] = useState<number | null>(null);
+  const [serverPrefillTpsMax, setServerPrefillTpsMax] = useState<number | null>(null);
   const [aggregatePeakTps, setAggregatePeakTps] = useState(0);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -267,6 +275,7 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
       tokenCount: 0,
       ttftMs: null,
       decodeTps: 0,
+      promptTps: 0,
       liveTokPerSec: 0,
       peakTokPerSec: 0,
       error: null,
@@ -300,6 +309,13 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
         return 0;
       })
       .filter((r) => r > 0);
+    if (!rates.length) return 0;
+    return rates.reduce((sum, r) => sum + r, 0) / rates.length;
+  }, [displayStreams]);
+
+  /** Mean per-stream prompt-processing tok/s (prompt tokens / TTFT). */
+  const sessionAvgPromptTps = useMemo(() => {
+    const rates = displayStreams.map((s) => s.promptTps || 0).filter((r) => r > 0);
     if (!rates.length) return 0;
     return rates.reduce((sum, r) => sum + r, 0) / rates.length;
   }, [displayStreams]);
@@ -439,12 +455,13 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
         port,
         modelId,
         serverTps,
+        serverPrefillTps,
         sessionAvgTps: runFinished ? sessionAvgTps : null,
       })
     );
     if (ok) flashCopied("all");
     else setRunError("Could not copy to clipboard");
-  }, [spark, displayStreams, port, modelId, serverTps, runFinished, sessionAvgTps, flashCopied]);
+  }, [spark, displayStreams, port, modelId, serverTps, serverPrefillTps, runFinished, sessionAvgTps, flashCopied]);
 
   const applySession = useCallback((data: ShowcaseSessionState, full: boolean) => {
     setSessionStatus(data.status);
@@ -454,8 +471,10 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
       const fromStream = data.streams.find((s) => s.model)?.model;
       if (fromStream) setModelId(fromStream);
     }
-    if (data.serverGenerationTps != null) setServerTps(data.serverGenerationTps);
-    if (data.serverGenerationTpsMax != null) setServerTpsMax(data.serverGenerationTpsMax);
+    setServerTps(data.serverGenerationTps ?? null);
+    setServerTpsMax(data.serverGenerationTpsMax ?? null);
+    setServerPrefillTps(data.serverPrefillTps ?? null);
+    setServerPrefillTpsMax(data.serverPrefillTpsMax ?? null);
     setStreams((prev) => {
       const byId = new Map(prev.map((s) => [s.streamId, s]));
       return data.streams.map((s) => {
@@ -489,6 +508,7 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
           tokenCount: s.tokenCount,
           ttftMs: s.ttftMs,
           decodeTps: s.decodeTps,
+          promptTps: s.promptTps || 0,
           liveTokPerSec: live,
           peakTokPerSec: peak,
           error: s.error,
@@ -582,6 +602,8 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
     setStreams([]);
     setServerTps(null);
     setServerTpsMax(null);
+    setServerPrefillTps(null);
+    setServerPrefillTpsMax(null);
     setAggregatePeakTps(0);
     try {
       const trimmed = prompts.map((p) => p.trim()).filter(Boolean);
@@ -782,9 +804,12 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
   const showMetricsStrip =
     aggregateTps > 0 ||
     sessionAvgTps > 0 ||
+    sessionAvgPromptTps > 0 ||
     totalTokens > 0 ||
     serverTps != null ||
     serverTpsMax != null ||
+    serverPrefillTps != null ||
+    serverPrefillTpsMax != null ||
     running ||
     (sessionStatus != null && sessionStatus !== "pending");
 
@@ -821,12 +846,17 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
             >
               Show controls
             </button>
-            {(aggregateTps > 0 || totalTokens > 0) && (
-              <div className="showcase-config-peek__tps" title="Aggregate tokens per second across all terminals">
+            {(aggregateTps > 0 || totalTokens > 0 || serverPrefillTps != null) && (
+              <div className="showcase-config-peek__tps" title="Aggregate generation tok/s across all terminals">
                 <span className="showcase-config-peek__tps-value font-tabular">
                   {aggregateTps > 0 ? `${aggregateTps.toFixed(0)}` : "—"}
                 </span>
-                <span className="showcase-config-peek__tps-unit">tok/s</span>
+                <span className="showcase-config-peek__tps-unit">gen tok/s</span>
+                {serverPrefillTps != null && (
+                  <span className="showcase-config-peek__tps-tokens font-tabular">
+                    · {serverPrefillTps.toFixed(0)} prompt
+                  </span>
+                )}
                 {totalTokens > 0 && (
                   <span className="showcase-config-peek__tps-tokens font-tabular">
                     · {formatToks(totalTokens)} tok
@@ -1132,7 +1162,10 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
                             <span>· {row.promptType}</span>
                           ) : null}
                           {row.meanDecodeTps > 0 && (
-                            <span>· avg {row.meanDecodeTps.toFixed(0)} tok/s</span>
+                            <span>· avg {row.meanDecodeTps.toFixed(0)} gen</span>
+                          )}
+                          {(row.meanPromptTps ?? 0) > 0 && (
+                            <span>· {(row.meanPromptTps ?? 0).toFixed(0)} prompt tok/s</span>
                           )}
                           {row.totalTokens > 0 && (
                             <span>· {formatToks(row.totalTokens)} tok</span>
@@ -1241,8 +1274,11 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
           <span className="showcase-metrics__sep" aria-hidden>
             ·
           </span>
-          <div className="showcase-metrics__item">
-            <span className="showcase-metrics__label">Server</span>
+          <div
+            className="showcase-metrics__item"
+            title="Server generation (decode) tok/s from engine /metrics"
+          >
+            <span className="showcase-metrics__label">Gen</span>
             <span className="showcase-metrics__value font-tabular">
               {serverTps != null ? `${serverTps.toFixed(0)}` : "—"}
               {serverTps != null && (
@@ -1252,6 +1288,30 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
             {serverTpsMax != null && serverTpsMax > 0 && (
                 <span className="showcase-metrics__sub">
                   peak {serverTpsMax.toFixed(0)}
+                </span>
+              )}
+          </div>
+          <span className="showcase-metrics__sep" aria-hidden>
+            ·
+          </span>
+          <div
+            className="showcase-metrics__item"
+            title="Server prompt-processing (prefill) tok/s from engine /metrics"
+          >
+            <span className="showcase-metrics__label">Prompt</span>
+            <span className="showcase-metrics__value font-tabular">
+              {serverPrefillTps != null
+                ? `${serverPrefillTps.toFixed(0)}`
+                : sessionAvgPromptTps > 0
+                  ? `${sessionAvgPromptTps.toFixed(0)}`
+                  : "—"}
+              {(serverPrefillTps != null || sessionAvgPromptTps > 0) && (
+                <span className="showcase-metrics__unit"> tok/s</span>
+              )}
+            </span>
+            {serverPrefillTpsMax != null && serverPrefillTpsMax > 0 && (
+                <span className="showcase-metrics__sub">
+                  peak {serverPrefillTpsMax.toFixed(0)}
                 </span>
               )}
           </div>
@@ -1301,6 +1361,7 @@ export function ShowcasePage({ sparkId }: ShowcasePageProps) {
               status={s.status}
               liveTokPerSec={s.liveTokPerSec}
               peakTokPerSec={s.peakTokPerSec}
+              promptTokPerSec={s.promptTps}
               content={renderContent}
               reasoning={renderReasoning}
               error={s.error}

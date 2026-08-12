@@ -156,6 +156,7 @@ export function LlmPanel({
 }: LlmPanelProps) {
   // Tail keyed by port so multi-port LLM sparklines stay distinct (8b).
   const genHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.tps`);
+  const prefillHistory = useMetricsHistoryTail(sparkId, `llm:${llmPort}.prefillTps`);
   const [showSettings, setShowSettings] = useState(false);
   const [portDraft, setPortDraft] = useState(String(llmPort));
   const [apiKeyDraft, setApiKeyDraft] = useState("");
@@ -181,6 +182,7 @@ export function LlmPanel({
   }, [clearEngineInfoTimer]);
 
   const generationTps = llm?.generationTps ?? 0;
+  const prefillTps = llm?.prefillTps ?? 0;
   const available = llm?.available ?? false;
 
   // Keep draft in sync when server pushes a different port (other tab / reload)
@@ -439,13 +441,34 @@ export function LlmPanel({
             </div>
           )}
 
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-muted">Generation tok/s</span>
-            <div className="flex items-center gap-2">
-              <Sparkline data={genHistory} color="var(--color-accent)" height={24} />
-              <span className="font-tabular text-sm font-semibold text-accent">
-                {generationTps.toFixed(1)}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <span
+                className="text-xs text-muted"
+                title="Decode / generation tokens per second from the engine"
+              >
+                Generation tok/s
               </span>
+              <div className="flex items-center gap-2">
+                <Sparkline data={genHistory} color="var(--color-accent)" height={24} />
+                <span className="font-tabular text-sm font-semibold text-accent">
+                  {generationTps.toFixed(1)}
+                </span>
+              </div>
+            </div>
+            <div className="flex items-center justify-between">
+              <span
+                className="text-xs text-muted"
+                title="Prompt processing (prefill) tokens per second from the engine"
+              >
+                Prompt tok/s
+              </span>
+              <div className="flex items-center gap-2">
+                <Sparkline data={prefillHistory} color="var(--color-accent)" height={24} />
+                <span className="font-tabular text-sm font-semibold text-accent">
+                  {prefillTps.toFixed(1)}
+                </span>
+              </div>
             </div>
           </div>
 

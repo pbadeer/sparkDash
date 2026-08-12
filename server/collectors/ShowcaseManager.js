@@ -15,6 +15,7 @@ import { decodeBenchManager } from "./DecodeBench.js";
 import {
   applyThinkingFlags,
   pollServerGenerationRates,
+  promptTpsFromTtft,
   round2,
   runStreamingRequest,
   streamTimeoutForTokens,
@@ -178,6 +179,8 @@ function publicSessionRecord(session, opts = {}) {
       tokenCount: s.tokenCount || 0,
       ttftMs: s.ttftMs ?? null,
       decodeTps: s.decodeTps || 0,
+      promptTokens: s.promptTokens ?? null,
+      promptTps: s.promptTps || 0,
       liveTokPerSec: s.liveTokPerSec || s.decodeTps || 0,
       peakTokPerSec: s.peakTokPerSec || 0,
       model: s.model ?? null,
@@ -190,6 +193,11 @@ function publicSessionRecord(session, opts = {}) {
   const meanDecodeTps =
     decodeRates.length > 0
       ? round2(decodeRates.reduce((a, b) => a + b, 0) / decodeRates.length)
+      : 0;
+  const promptRates = streams.map((s) => s.promptTps || 0).filter((r) => r > 0);
+  const meanPromptTps =
+    promptRates.length > 0
+      ? round2(promptRates.reduce((a, b) => a + b, 0) / promptRates.length)
       : 0;
   const peakStreamTps = streams.reduce(
     (m, s) => Math.max(m, s.peakTokPerSec || 0, s.decodeTps || 0),
@@ -213,8 +221,12 @@ function publicSessionRecord(session, opts = {}) {
     serverGenerationTps: session.serverGenerationTps ?? null,
     serverGenerationTpsMax: session.serverGenerationTpsMax ?? null,
     serverGenerationSamples: session.serverGenerationSamples ?? 0,
+    serverPrefillTps: session.serverPrefillTps ?? null,
+    serverPrefillTpsMax: session.serverPrefillTpsMax ?? null,
+    serverPrefillSamples: session.serverPrefillSamples ?? 0,
     totalTokens,
     meanDecodeTps,
+    meanPromptTps,
     peakStreamTps,
     streamCount: streams.length,
     streams,
@@ -240,8 +252,11 @@ function historySummary(record) {
     completedAt: record.completedAt ?? null,
     serverGenerationTps: record.serverGenerationTps ?? null,
     serverGenerationTpsMax: record.serverGenerationTpsMax ?? null,
+    serverPrefillTps: record.serverPrefillTps ?? null,
+    serverPrefillTpsMax: record.serverPrefillTpsMax ?? null,
     totalTokens: record.totalTokens ?? 0,
     meanDecodeTps: record.meanDecodeTps ?? 0,
+    meanPromptTps: record.meanPromptTps ?? 0,
     peakStreamTps: record.peakStreamTps ?? 0,
     streamCount: record.streamCount ?? record.streams?.length ?? 0,
     error: record.error ?? null,
@@ -527,6 +542,8 @@ export class ShowcaseManager {
       tokenCount: 0,
       ttftMs: null,
       decodeTps: 0,
+      promptTokens: null,
+      promptTps: 0,
       liveTokPerSec: 0,
       peakTokPerSec: 0,
       model: null,
@@ -560,6 +577,10 @@ export class ShowcaseManager {
       serverGenerationTps: null,
       serverGenerationTpsMax: null,
       serverGenerationSamples: 0,
+      /** Live /metrics prompt-processing (prefill) tok/s strip */
+      serverPrefillTps: null,
+      serverPrefillTpsMax: null,
+      serverPrefillSamples: 0,
       _abort: abort,
       _lastTouchAt: now,
       _contentCap: cap,
@@ -635,6 +656,8 @@ export class ShowcaseManager {
         tokenCount: s.tokenCount,
         ttftMs: s.ttftMs,
         decodeTps: s.decodeTps,
+        promptTokens: s.promptTokens ?? null,
+        promptTps: s.promptTps || 0,
         liveTokPerSec: s.liveTokPerSec,
         peakTokPerSec: s.peakTokPerSec || 0,
         model: s.model,
@@ -669,6 +692,9 @@ export class ShowcaseManager {
       serverGenerationTps: session.serverGenerationTps,
       serverGenerationTpsMax: session.serverGenerationTpsMax,
       serverGenerationSamples: session.serverGenerationSamples,
+      serverPrefillTps: session.serverPrefillTps,
+      serverPrefillTpsMax: session.serverPrefillTpsMax,
+      serverPrefillSamples: session.serverPrefillSamples,
       streams,
       error: session.error,
       fromHistory: false,
@@ -718,6 +744,9 @@ export class ShowcaseManager {
     if (info?.tLast != null) stream._tLast = info.tLast;
     if (info?.tokenCount != null) stream.tokenCount = info.tokenCount;
     if (info?.model) stream.model = info.model;
+    if (info?.promptTokens != null && info.promptTokens > 0) {
+      stream.promptTokens = info.promptTokens;
+    }
 
     // Floor token count with char estimate — SSE event counts under-report when
     // the backend batches multiple tokens per delta (common on vLLM).
@@ -730,6 +759,10 @@ export class ShowcaseManager {
 
     if (stream._t0 != null && stream._tFirst != null && stream.ttftMs == null) {
       stream.ttftMs = round2(stream._tFirst - stream._t0);
+    }
+
+    if (stream.promptTokens > 0 && stream.ttftMs > 0) {
+      stream.promptTps = promptTpsFromTtft(stream.promptTokens, stream.ttftMs);
     }
 
     // Same window as final decodeTps: first visible token → last visible token
@@ -800,9 +833,16 @@ export class ShowcaseManager {
         apiKey: session._apiKey,
         onSample: (info) => {
           if (session.status !== "running") return;
-          session.serverGenerationTps = info.median;
-          session.serverGenerationTpsMax = info.max;
-          session.serverGenerationSamples = info.samples;
+          if (info.samples > 0) {
+            session.serverGenerationTps = info.median;
+            session.serverGenerationTpsMax = info.max;
+            session.serverGenerationSamples = info.samples;
+          }
+          if (info.prefillSamples > 0) {
+            session.serverPrefillTps = info.prefillMedian;
+            session.serverPrefillTpsMax = info.prefillMax;
+            session.serverPrefillSamples = info.prefillSamples;
+          }
           this._bumpRev(session);
         },
       }
@@ -910,6 +950,13 @@ export class ShowcaseManager {
             stream.decodeTps || 0,
             stream.liveTokPerSec || 0
           );
+          if (result.promptTokens != null && result.promptTokens > 0) {
+            stream.promptTokens = result.promptTokens;
+          }
+          stream.promptTps =
+            result.promptTps != null && result.promptTps > 0
+              ? result.promptTps
+              : promptTpsFromTtft(stream.promptTokens, stream.ttftMs);
           if (result.model) stream.model = result.model;
 
           // Prefer live buffers; fill gaps from final collectContent
@@ -954,6 +1001,9 @@ export class ShowcaseManager {
       if (rateStats.median != null) session.serverGenerationTps = rateStats.median;
       if (rateStats.max != null) session.serverGenerationTpsMax = rateStats.max;
       session.serverGenerationSamples = rateStats.samples;
+      if (rateStats.prefillMedian != null) session.serverPrefillTps = rateStats.prefillMedian;
+      if (rateStats.prefillMax != null) session.serverPrefillTpsMax = rateStats.prefillMax;
+      session.serverPrefillSamples = rateStats.prefillSamples;
 
       if (session.status === "running") {
         this._finalizeSession(session);

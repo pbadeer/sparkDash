@@ -69,60 +69,107 @@ export function sleep(ms, signal) {
 }
 
 /**
- * Read cumulative generation (output) token counters from the server —
- * same sources as LlmProbe live tok/s.
+ * Prompt-processing (prefill) tok/s from prompt token count and TTFT.
+ * TTFT includes queue + first-token overhead, so this is a lower bound on
+ * engine prefill speed — still the right per-request figure when /metrics
+ * is unavailable.
+ * @param {number | null | undefined} promptTokens
+ * @param {number | null | undefined} ttftMs
+ * @returns {number}
+ */
+export function promptTpsFromTtft(promptTokens, ttftMs) {
+  const toks = Number(promptTokens);
+  const ms = Number(ttftMs);
+  if (!(toks > 0) || !(ms > 0)) return 0;
+  return round2((toks / ms) * 1000);
+}
+
+/**
+ * Sum matching Prometheus samples from an exposition dump.
+ * @param {string} txt
+ * @param {RegExp} re must have one capture group for the value
+ * @returns {number | null}
+ */
+function sumPromSeries(txt, re) {
+  let sum = 0;
+  let found = false;
+  let m;
+  const flags = re.flags.includes("g") ? re.flags : `${re.flags}g`;
+  const copy = new RegExp(re.source, flags);
+  while ((m = copy.exec(txt)) !== null) {
+    const v = parseFloat(m[1]);
+    if (Number.isFinite(v)) {
+      sum += v;
+      found = true;
+    }
+  }
+  return found ? sum : null;
+}
+
+function parseTokenCountersFromMetrics(txt) {
+  const generation =
+    sumPromSeries(
+      txt,
+      /^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    );
+  const prompt =
+    sumPromSeries(
+      txt,
+      /^ds4_tokens_prefilled_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^vllm:prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^sglang:prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    ) ??
+    sumPromSeries(
+      txt,
+      /^sglang_prompt_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
+    );
+  return { generation, prompt };
+}
+
+/**
+ * Read cumulative generation (decode) and prompt (prefill) token counters —
+ * same sources as LlmProbe live tok/s. One /metrics fetch covers both.
  * @param {string} baseUrl
  * @param {{ apiKey?: string | null }} [opts]
- * @returns {Promise<number | null>}
+ * @returns {Promise<{ generation: number | null, prompt: number | null }>}
  */
-export async function readServerGenerationTokens(baseUrl, opts = {}) {
+export async function readServerTokenCounters(baseUrl, opts = {}) {
   const headers = {};
   const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
-  // Prometheus (vLLM or ds4-server) — prefer whichever series is present
   try {
     const res = await fetch(`${baseUrl}/metrics`, {
       signal: AbortSignal.timeout(5_000),
       headers,
     });
     if (res.ok) {
-      const txt = await res.text();
-      const fromSeries = (re) => {
-        let sum = 0;
-        let found = false;
-        let m;
-        while ((m = re.exec(txt)) !== null) {
-          const v = parseFloat(m[1]);
-          if (Number.isFinite(v)) {
-            sum += v;
-            found = true;
-          }
-        }
-        return found ? sum : null;
-      };
-      const ds4 = fromSeries(
-        /^ds4_tokens_decoded_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-      );
-      if (ds4 != null) return ds4;
-      const vllm = fromSeries(
-        /^vllm:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-      );
-      if (vllm != null) return vllm;
-      const sglang =
-        fromSeries(
-          /^sglang:generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        ) ??
-        fromSeries(
-          /^sglang_generation_tokens_total(?:\{[^}]*\})?\s+([\d.eE+-]+)\s*$/gm
-        );
-      if (sglang != null) return sglang;
+      const parsed = parseTokenCountersFromMetrics(await res.text());
+      if (parsed.generation != null || parsed.prompt != null) return parsed;
     }
   } catch {
     /* try next */
   }
 
-  // SGLang
+  // SGLang /get_server_info
   try {
     const res = await fetch(`${baseUrl}/get_server_info`, {
       signal: AbortSignal.timeout(5_000),
@@ -130,16 +177,76 @@ export async function readServerGenerationTokens(baseUrl, opts = {}) {
     });
     if (res.ok) {
       const data = await res.json();
-      if (data?.total_output_tokens != null) {
-        const v = Number(data.total_output_tokens);
-        if (Number.isFinite(v)) return v;
+      const generation =
+        data?.total_output_tokens != null && Number.isFinite(Number(data.total_output_tokens))
+          ? Number(data.total_output_tokens)
+          : null;
+      const prompt =
+        data?.total_input_tokens != null && Number.isFinite(Number(data.total_input_tokens))
+          ? Number(data.total_input_tokens)
+          : null;
+      if (generation != null || prompt != null) return { generation, prompt };
+    }
+  } catch {
+    /* try next */
+  }
+
+  // llama.cpp /slots — cumulative n_decoded / n_prompt_tokens_processed
+  try {
+    const res = await fetch(`${baseUrl}/slots`, {
+      signal: AbortSignal.timeout(5_000),
+      headers,
+    });
+    if (res.ok) {
+      const slots = await res.json();
+      if (Array.isArray(slots) && slots.length) {
+        let generation = 0;
+        let prompt = 0;
+        let foundGen = false;
+        let foundPrompt = false;
+        for (const slot of slots) {
+          const decoded =
+            slot?.n_decoded != null
+              ? Array.isArray(slot.n_decoded)
+                ? slot.n_decoded[0] || 0
+                : slot.n_decoded
+              : slot?.next_token?.[0]?.n_decoded;
+          const prompted =
+            slot?.n_prompt_tokens_processed ?? slot?.n_prompt_tokens;
+          if (decoded != null && Number.isFinite(Number(decoded))) {
+            generation += Number(decoded);
+            foundGen = true;
+          }
+          if (prompted != null && Number.isFinite(Number(prompted))) {
+            prompt += Number(prompted);
+            foundPrompt = true;
+          }
+        }
+        if (foundGen || foundPrompt) {
+          return {
+            generation: foundGen ? generation : null,
+            prompt: foundPrompt ? prompt : null,
+          };
+        }
       }
     }
   } catch {
     /* ignore */
   }
 
-  return null;
+  return { generation: null, prompt: null };
+}
+
+/**
+ * Read cumulative generation (output) token counters from the server —
+ * same sources as LlmProbe live tok/s.
+ * @param {string} baseUrl
+ * @param {{ apiKey?: string | null }} [opts]
+ * @returns {Promise<number | null>}
+ */
+export async function readServerGenerationTokens(baseUrl, opts = {}) {
+  const counters = await readServerTokenCounters(baseUrl, opts);
+  return counters.generation;
 }
 
 /** Pick correlatable response headers for the debug trace. */
@@ -249,14 +356,27 @@ export function stripThinkingFlags(body) {
 }
 
 /**
- * Poll server generation counters the same way live LlmProbe does (Δtokens / Δt).
- * Returns the median of positive samples while generation is active.
+ * Poll server generation + prompt (prefill) counters the same way live
+ * LlmProbe does (Δtokens / Δt). Returns the median of positive samples
+ * while each phase is active.
  *
  * @param {string} baseUrl
  * @param {AbortSignal} signal
  * @param {number} [intervalMs=400]
- * @param {{ onSample?: (info: { rate: number, median: number | null, max: number | null, samples: number }) => void, apiKey?: string | null }} [opts]
- * @returns {Promise<{ median: number | null, mean: number | null, max: number | null, samples: number }>}
+ * @param {{ onSample?: (info: {
+ *   rate: number,
+ *   median: number | null,
+ *   max: number | null,
+ *   samples: number,
+ *   prefillRate: number,
+ *   prefillMedian: number | null,
+ *   prefillMax: number | null,
+ *   prefillSamples: number,
+ * }) => void, apiKey?: string | null }} [opts]
+ * @returns {Promise<{
+ *   median: number | null, mean: number | null, max: number | null, samples: number,
+ *   prefillMedian: number | null, prefillMean: number | null, prefillMax: number | null, prefillSamples: number,
+ * }>}
  */
 export async function pollServerGenerationRates(
   baseUrl,
@@ -266,10 +386,30 @@ export async function pollServerGenerationRates(
 ) {
   /** @type {number[]} */
   const rates = [];
+  /** @type {number[]} */
+  const prefillRates = [];
   const apiKey = opts?.apiKey != null ? String(opts.apiKey).trim() : "";
-  let lastTokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
+  let last = await readServerTokenCounters(baseUrl, { apiKey: apiKey || null });
   let lastT = performance.now();
   const onSample = typeof opts.onSample === "function" ? opts.onSample : null;
+
+  const emit = (rate) => {
+    if (!onSample) return;
+    try {
+      onSample({
+        rate: round2(rate),
+        median: rates.length ? round2(median(rates)) : null,
+        max: rates.length ? round2(Math.max(...rates)) : null,
+        samples: rates.length,
+        prefillRate: prefillRates.length ? round2(prefillRates[prefillRates.length - 1]) : 0,
+        prefillMedian: prefillRates.length ? round2(median(prefillRates)) : null,
+        prefillMax: prefillRates.length ? round2(Math.max(...prefillRates)) : null,
+        prefillSamples: prefillRates.length,
+      });
+    } catch {
+      /* non-fatal */
+    }
+  };
 
   while (!signal.aborted) {
     try {
@@ -278,45 +418,54 @@ export async function pollServerGenerationRates(
       break;
     }
     const now = performance.now();
-    const tokens = await readServerGenerationTokens(baseUrl, { apiKey: apiKey || null });
-    if (tokens == null || lastTokens == null) {
-      if (tokens != null) {
-        lastTokens = tokens;
-        lastT = now;
-      }
-      continue;
-    }
+    const cur = await readServerTokenCounters(baseUrl, { apiKey: apiKey || null });
     const dtSec = (now - lastT) / 1000;
-    const dTok = tokens - lastTokens;
-    lastTokens = tokens;
     lastT = now;
-    // Ignore idle / counter reset samples (same guards as LlmProbe dt window)
-    if (dtSec > 0 && dtSec < 10 && dTok > 0) {
-      const rate = dTok / dtSec;
-      rates.push(rate);
-      if (onSample) {
-        try {
-          onSample({
-            rate: round2(rate),
-            median: rates.length ? round2(median(rates)) : null,
-            max: rates.length ? round2(Math.max(...rates)) : null,
-            samples: rates.length,
-          });
-        } catch {
-          /* non-fatal */
+
+    let genRate = 0;
+    let saw = false;
+    if (dtSec > 0 && dtSec < 10) {
+      if (cur.generation != null && last.generation != null) {
+        const dTok = cur.generation - last.generation;
+        if (dTok > 0) {
+          genRate = dTok / dtSec;
+          rates.push(genRate);
+          saw = true;
+        }
+      }
+      if (cur.prompt != null && last.prompt != null) {
+        const dTok = cur.prompt - last.prompt;
+        if (dTok > 0) {
+          prefillRates.push(dTok / dtSec);
+          saw = true;
         }
       }
     }
+    if (cur.generation != null) last.generation = cur.generation;
+    if (cur.prompt != null) last.prompt = cur.prompt;
+    if (saw) emit(genRate);
   }
 
-  if (!rates.length) {
-    return { median: null, mean: null, max: null, samples: 0 };
-  }
+  const empty = {
+    median: null,
+    mean: null,
+    max: null,
+    samples: 0,
+    prefillMedian: null,
+    prefillMean: null,
+    prefillMax: null,
+    prefillSamples: 0,
+  };
+  if (!rates.length && !prefillRates.length) return empty;
   return {
-    median: round2(median(rates)),
-    mean: round2(mean(rates)),
-    max: round2(Math.max(...rates)),
+    median: rates.length ? round2(median(rates)) : null,
+    mean: rates.length ? round2(mean(rates)) : null,
+    max: rates.length ? round2(Math.max(...rates)) : null,
     samples: rates.length,
+    prefillMedian: prefillRates.length ? round2(median(prefillRates)) : null,
+    prefillMean: prefillRates.length ? round2(mean(prefillRates)) : null,
+    prefillMax: prefillRates.length ? round2(Math.max(...prefillRates)) : null,
+    prefillSamples: prefillRates.length,
   };
 }
 
@@ -392,6 +541,8 @@ async function runStreamingRequestOnce(
   let reasoningChunkCount = 0;
   let chunkTokenCount = 0;
   let usageCompletionTokens = null;
+  /** @type {number | null} */
+  let usagePromptTokens = null;
   /** @type {Record<string, number> | null} */
   let usage = null;
   let model = null;
@@ -477,6 +628,10 @@ async function runStreamingRequestOnce(
           if (debug && json.id && !completionId) completionId = String(json.id);
           if (json.model) model = json.model;
           if (json.usage && typeof json.usage === "object") {
+            if (json.usage.prompt_tokens != null) {
+              const n = Number(json.usage.prompt_tokens);
+              if (Number.isFinite(n) && n > 0) usagePromptTokens = n;
+            }
             if (debug) {
               usage = {
                 promptTokens: Number(json.usage.prompt_tokens) || 0,
@@ -516,6 +671,7 @@ async function runStreamingRequestOnce(
                   answer: answer || undefined,
                   reasoning: reasoning || undefined,
                   tokenCount: chunkTokenCount,
+                  promptTokens: usagePromptTokens,
                   tFirst,
                   tLast,
                   model,
@@ -554,6 +710,7 @@ async function runStreamingRequestOnce(
     tFirst != null && tLast != null && tLast > tFirst ? tLast - tFirst : 0;
   const decodeTps =
     decodeMs > 0 && decodeTokens > 0 ? (decodeTokens / decodeMs) * 1000 : 0;
+  const promptTps = promptTpsFromTtft(usagePromptTokens, ttftMs);
 
   /** @type {Record<string, unknown>} */
   const out = {
@@ -563,6 +720,8 @@ async function runStreamingRequestOnce(
     reasoningChunks: reasoningChunkCount,
     decodeMs: round2(decodeMs),
     completionTokens,
+    promptTokens: usagePromptTokens,
+    promptTps,
     decodeTokens,
     decodeTps: round2(decodeTps),
     totalMs: round2(totalMs),

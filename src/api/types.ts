@@ -636,6 +636,10 @@ export interface ShowcaseStreamState {
   tokenCount: number;
   ttftMs: number | null;
   decodeTps: number;
+  /** Prompt tokens from stream usage (null until the server reports them). */
+  promptTokens?: number | null;
+  /** Prompt-processing tok/s: promptTokens / TTFT. */
+  promptTps?: number;
   liveTokPerSec: number;
   peakTokPerSec?: number;
   model: string | null;
@@ -661,8 +665,13 @@ export interface ShowcaseSessionState {
   serverGenerationTps?: number | null;
   serverGenerationTpsMax?: number | null;
   serverGenerationSamples?: number;
+  /** Median server prompt-processing (prefill) tok/s from /metrics (null if unavailable). */
+  serverPrefillTps?: number | null;
+  serverPrefillTpsMax?: number | null;
+  serverPrefillSamples?: number;
   totalTokens?: number;
   meanDecodeTps?: number;
+  meanPromptTps?: number;
   peakStreamTps?: number;
   streamCount?: number;
   streams: ShowcaseStreamState[];
@@ -687,8 +696,11 @@ export interface ShowcaseHistorySummary {
   completedAt?: number | null;
   serverGenerationTps?: number | null;
   serverGenerationTpsMax?: number | null;
+  serverPrefillTps?: number | null;
+  serverPrefillTpsMax?: number | null;
   totalTokens: number;
   meanDecodeTps: number;
+  meanPromptTps?: number;
   peakStreamTps: number;
   streamCount: number;
   error?: string | null;
