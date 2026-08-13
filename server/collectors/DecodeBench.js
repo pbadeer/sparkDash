@@ -14,6 +14,7 @@ import {
   applyThinkingFlags,
   mean,
   median,
+  pollServerGenerationRates,
   round2,
   runStreamingRequest,
   sleep,
@@ -144,6 +145,53 @@ function pickDistinctPrompts(count) {
 /**
  * Run one concurrency wave: N simultaneous streams, each with a different prompt.
  */
+function emptyRateStats() {
+  return {
+    median: null,
+    max: null,
+    samples: 0,
+    prefillMedian: null,
+    prefillMax: null,
+    prefillSamples: 0,
+  };
+}
+
+function attachRateStats(wave, rateStats) {
+  const stats = rateStats || emptyRateStats();
+  wave.serverGenerationTps = stats.median ?? null;
+  wave.serverGenerationTpsMax = stats.max ?? null;
+  wave.serverGenerationSamples = stats.samples ?? 0;
+  wave.serverPrefillTps = stats.prefillMedian ?? null;
+  wave.serverPrefillTpsMax = stats.prefillMax ?? null;
+  wave.serverPrefillSamples = stats.prefillSamples ?? 0;
+  return wave;
+}
+
+/** Per-stream prompt-processing aggregates (prompt tokens / TTFT window). */
+function promptAggregates(ok) {
+  const promptTpsList = ok.map((r) => r.promptTps).filter((n) => n > 0);
+  const totalPromptTokens = ok.reduce((s, r) => s + (Number(r.promptTokens) || 0), 0);
+  let aggregatePromptTps = 0;
+  const t0s = [];
+  const firsts = [];
+  for (const r of ok) {
+    if (r.tFirst == null) continue;
+    firsts.push(r.tFirst);
+    const t0 = r.tFirst - (Number(r.ttftMs) || 0);
+    if (Number.isFinite(t0)) t0s.push(t0);
+  }
+  if (totalPromptTokens > 0 && t0s.length && firsts.length) {
+    const windowMs = Math.max(...firsts) - Math.min(...t0s);
+    if (windowMs > 0) aggregatePromptTps = (totalPromptTokens / windowMs) * 1000;
+  }
+  return {
+    meanPromptTps: round2(mean(promptTpsList)),
+    medianPromptTps: round2(median(promptTpsList)),
+    aggregatePromptTps: round2(aggregatePromptTps),
+    totalPromptTokens,
+  };
+}
+
 function emptyWaveResult(concurrency, waveMs, results, modelId, error, prompts = [], debug = false) {
   return {
     concurrency,
@@ -161,7 +209,16 @@ function emptyWaveResult(concurrency, waveMs, results, modelId, error, prompts =
      * Server-side generation tok/s (same basis as live Generation tok/s panel).
      * Null when the backend does not expose counters.
      */
-
+    serverGenerationTps: null,
+    serverGenerationTpsMax: null,
+    serverGenerationSamples: 0,
+    serverPrefillTps: null,
+    serverPrefillTpsMax: null,
+    serverPrefillSamples: 0,
+    meanPromptTps: 0,
+    medianPromptTps: 0,
+    aggregatePromptTps: 0,
+    totalPromptTokens: 0,
     totalDecodeTokens: 0,
     totalCompletionTokens: 0,
     durationMs: round2(waveMs),
@@ -190,6 +247,8 @@ function streamPublicResult(r, index, prompt, reqMeta, debug = false) {
     decodeTps: r?.decodeTps ?? 0,
     decodeTokens: r?.decodeTokens ?? 0,
     completionTokens: r?.completionTokens ?? 0,
+    promptTokens: r?.promptTokens ?? null,
+    promptTps: r?.promptTps ?? 0,
     totalMs: r?.totalMs ?? 0,
     error: r?.error ?? null,
   };
@@ -251,6 +310,12 @@ async function runConcurrencyWave({
   const hwPollPromise = debug
     ? pollHardwareSamples(sampleHardware, hwPollAbort.signal, HARDWARE_SAMPLE_MS)
     : Promise.resolve([]);
+  const ratePollPromise = pollServerGenerationRates(
+    baseUrl,
+    hwPollAbort.signal,
+    400,
+    { apiKey: apiKey || null }
+  );
 
   const controllers = [];
 
@@ -307,7 +372,7 @@ async function runConcurrencyWave({
 
   const wallEnd = performance.now();
   const waveMs = wallEnd - wallStart;
-  const hardwareSamples = await hwPollPromise;
+  const [hardwareSamples, rateStats] = await Promise.all([hwPollPromise, ratePollPromise]);
 
   if (waveTimedOut && results.every((r) => r.error)) {
     const empty = emptyWaveResult(
@@ -319,6 +384,7 @@ async function runConcurrencyWave({
       prompts,
       debug
     );
+    attachRateStats(empty, rateStats);
     if (debug) empty.hardwareSamples = hardwareSamples;
     return empty;
   }
@@ -329,6 +395,7 @@ async function runConcurrencyWave({
   const ttftList = ok.map((r) => r.ttftMs);
   const totalDecodeTokens = ok.reduce((s, r) => s + r.decodeTokens, 0);
   const totalCompletionTokens = ok.reduce((s, r) => s + r.completionTokens, 0);
+  const promptStats = promptAggregates(ok);
 
   // Client aggregate over concurrent first→last content window (network-affected)
   let aggregateDecodeTps = 0;
@@ -355,6 +422,7 @@ async function runConcurrencyWave({
     meanTtftMs: round2(mean(ttftList)),
     medianTtftMs: round2(median(ttftList)),
     aggregateDecodeTps: round2(aggregateDecodeTps),
+    ...promptStats,
 
     totalDecodeTokens,
     totalCompletionTokens,
@@ -369,6 +437,7 @@ async function runConcurrencyWave({
     ),
     model,
   };
+  attachRateStats(wave, rateStats);
   if (debug) wave.hardwareSamples = hardwareSamples;
   return wave;
 }

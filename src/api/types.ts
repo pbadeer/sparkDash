@@ -495,6 +495,10 @@ export interface DecodeBenchStreamResult {
   decodeTps: number;
   decodeTokens: number;
   completionTokens: number;
+  /** Prompt tokens from usage, when the backend reports them. */
+  promptTokens?: number | null;
+  /** Prompt-processing tok/s: promptTokens / TTFT. */
+  promptTps?: number;
   totalMs: number;
   error: string | null;
   /** Exact prompt used for this stream (debug). */
@@ -545,6 +549,20 @@ export interface DecodeBenchLevelResult {
   aggregateDecodeTps: number;
   totalDecodeTokens: number;
   totalCompletionTokens: number;
+  /** Mean per-stream prompt-processing tok/s (prompt tokens / TTFT). */
+  meanPromptTps?: number;
+  medianPromptTps?: number;
+  /** Client: total prompt tokens / concurrent prefill window (t0 → first token). */
+  aggregatePromptTps?: number;
+  totalPromptTokens?: number;
+  /** Median server prompt-processing (prefill) tok/s from /metrics (null if unavailable). */
+  serverPrefillTps?: number | null;
+  serverPrefillTpsMax?: number | null;
+  serverPrefillSamples?: number;
+  /** Median server generation (decode) tok/s from /metrics (null if unavailable). */
+  serverGenerationTps?: number | null;
+  serverGenerationTpsMax?: number | null;
+  serverGenerationSamples?: number;
   durationMs: number;
   error: string | null;
   streams: DecodeBenchStreamResult[];

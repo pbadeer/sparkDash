@@ -74,10 +74,27 @@ function formatTtft(ms: number): string {
   return `${Math.round(ms)}ms`;
 }
 
+function formatTps(n: number | null | undefined): string | null {
+  if (n == null || !(n > 0)) return null;
+  return n.toFixed(1);
+}
+
+/** Prompt-processing tok/s: engine /metrics when sampled, else client prompt/TTFT. */
+function processingTps(r: DecodeBenchJob["results"][number]): number | null {
+  if (r.serverPrefillTps != null && r.serverPrefillTps > 0) return r.serverPrefillTps;
+  if (r.aggregatePromptTps != null && r.aggregatePromptTps > 0) return r.aggregatePromptTps;
+  if (r.meanPromptTps != null && r.meanPromptTps > 0) return r.meanPromptTps;
+  return null;
+}
+
+function generatedTps(r: DecodeBenchJob["results"][number]): number {
+  return r.aggregateDecodeTps > 0 ? r.aggregateDecodeTps : r.meanDecodeTps;
+}
+
 /**
  * Build a plain-text benchmark summary for the clipboard.
  * Format: "<model> | decode tok/s results:" header, then one line per
- * concurrency level with decode tok/s and key metrics.
+ * concurrency level with processing + generated tok/s and key metrics.
  */
 function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
   const name = modelId || "unknown model";
@@ -88,8 +105,9 @@ function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
     .sort((a, b) => a.concurrency - b.concurrency)
     .map((r) => {
       if (r.totalDecodeTokens > 0 || r.totalCompletionTokens > 0) {
-        const agg = r.aggregateDecodeTps > 0 ? r.aggregateDecodeTps : r.meanDecodeTps;
-        return `×${r.concurrency}  ${agg.toFixed(0)} agg  ${r.meanDecodeTps.toFixed(0)}/str  · TTFT ${formatTtft(r.medianTtftMs)}`;
+        const proc = processingTps(r);
+        const procPart = proc != null ? `${proc.toFixed(0)} proc  ` : "";
+        return `×${r.concurrency}  ${procPart}${generatedTps(r).toFixed(0)} gen  ${r.meanDecodeTps.toFixed(0)}/str  · TTFT ${formatTtft(r.medianTtftMs)}`;
       }
       return `×${r.concurrency}  failed${r.error ? ` — ${r.error}` : ""}`;
     });
@@ -98,6 +116,8 @@ function buildShareText(job: DecodeBenchJob, modelId: string | null): string {
 }
 
 function ResultRow({ r }: { r: DecodeBenchJob["results"][number] }) {
+  const proc = formatTps(processingTps(r));
+  const gen = generatedTps(r);
   return (
     <article className="bench-result-row" title={r.error || undefined}>
       <div className="bench-result-row__load">
@@ -119,14 +139,30 @@ function ResultRow({ r }: { r: DecodeBenchJob["results"][number] }) {
       </div>
 
       <div className="bench-result-row__speeds">
-        <div className="bench-result-row__metric">
-          <span className="bench-result-row__label">Aggregate</span>
+        <div
+          className="bench-result-row__metric"
+          title="Prompt processing (prefill) tok/s — engine /metrics when available, otherwise prompt tokens / TTFT"
+        >
+          <span className="bench-result-row__label">Processing</span>
+          <span className="bench-result-row__value">
+            {proc ?? "—"}
+            {proc != null && <span className="bench-result-row__unit">tok/s</span>}
+          </span>
+        </div>
+        <div
+          className="bench-result-row__metric"
+          title="Aggregate decode / generation tok/s across concurrent streams"
+        >
+          <span className="bench-result-row__label">Generated</span>
           <span className="bench-result-row__value bench-result-row__value--accent">
-            {(r.aggregateDecodeTps > 0 ? r.aggregateDecodeTps : r.meanDecodeTps).toFixed(1)}
+            {gen.toFixed(1)}
             <span className="bench-result-row__unit">tok/s</span>
           </span>
         </div>
-        <div className="bench-result-row__metric">
+        <div
+          className="bench-result-row__metric"
+          title="Mean per-stream decode tok/s after first token"
+        >
           <span className="bench-result-row__label">Stream</span>
           <span className="bench-result-row__value">
             {r.meanDecodeTps.toFixed(1)}
@@ -548,7 +584,8 @@ export function BenchmarkDialog({
                   <div className="bench-results__head" aria-hidden="true">
                     <span>Load</span>
                     <span className="bench-results__head-speeds">
-                      <span>Aggregate</span>
+                      <span>Processing</span>
+                      <span>Generated</span>
                       <span>Stream</span>
                     </span>
                   </div>
@@ -560,8 +597,9 @@ export function BenchmarkDialog({
 
               {job.results.length > 0 && (
                 <p className="bench-legend">
-                  <strong>Aggregate</strong> — total tok/s across all concurrent streams.{" "}
-                  <strong>Stream</strong> — per-stream average.
+                  <strong>Processing</strong> — prompt (prefill) tok/s.{" "}
+                  <strong>Generated</strong> — total decode tok/s across concurrent streams.{" "}
+                  <strong>Stream</strong> — per-stream average decode.
                 </p>
               )}
             </section>
